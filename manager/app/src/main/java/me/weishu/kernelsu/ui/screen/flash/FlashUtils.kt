@@ -73,6 +73,7 @@ sealed class FlashIt : Parcelable {
         val lkm: LkmSelection,
         val ota: Boolean,
         val partition: String? = null,
+        val bootImageKind: String? = null,
         val allowShell: Boolean = false,
         val enableAdb: Boolean = false,
     ) : FlashIt()
@@ -113,6 +114,7 @@ fun flashIt(
             flashIt.lkm,
             flashIt.ota,
             flashIt.partition,
+            flashIt.bootImageKind,
             flashIt.allowShell,
             flashIt.enableAdb,
             onStdout,

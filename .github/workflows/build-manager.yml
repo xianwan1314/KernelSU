@@ -1,11 +1,13 @@
 name: Build Manager
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "main", "dev", "ci" ]
     paths:
       - '.github/workflows/build-manager.yml'
       - '.github/workflows/build-lkm.yml'
+      - '.github/workflows/build-lkm-vivo.yml'
       - '.github/workflows/ddk-lkm.yml'
       - '.github/workflows/ksud.yml'
       - '.github/workflows/ksud-extra.yml'
@@ -19,6 +21,7 @@ on:
     paths:
       - '.github/workflows/build-manager.yml'
       - '.github/workflows/build-lkm.yml'
+      - '.github/workflows/build-lkm-vivo.yml'
       - '.github/workflows/ddk-lkm.yml'
       - '.github/workflows/ksud.yml'
       - '.github/workflows/ksud-extra.yml'
@@ -35,9 +38,10 @@ jobs:
     outputs:
       expected_size: ${{ steps.extract.outputs.expected_size }}
       expected_hash: ${{ steps.extract.outputs.expected_hash }}
-      keystore: ${{ steps.gen.outputs.keystore }}
-      keystore_password: ${{ steps.gen.outputs.keystore_password }}
-      key_password: ${{ steps.gen.outputs.key_password }}
+      keystore: ${{ github.event_name == 'pull_request' && steps.gen.outputs.keystore || steps.gen_prod.outputs.keystore }}
+      keystore_password: ${{ github.event_name == 'pull_request' && steps.gen.outputs.keystore_password || steps.gen_prod.outputs.keystore_password }}
+      key_password: ${{ github.event_name == 'pull_request' && steps.gen.outputs.key_password || steps.gen_prod.outputs.key_password }}
+      key_alias: ${{ github.event_name == 'pull_request' && steps.gen.outputs.key_alias || steps.gen_prod.outputs.key_alias }}
     steps:
       - name: Generate temporary keystore
         if: github.event_name == 'pull_request'
@@ -47,6 +51,7 @@ jobs:
           KEY_PASSWORD=$(openssl rand -hex 32)
           echo "keystore_password=$KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
           echo "key_password=$KEY_PASSWORD" >> $GITHUB_OUTPUT
+          echo "key_alias=pr-key" >> $GITHUB_OUTPUT
 
           keytool -genkeypair \
             -alias pr-key \
@@ -60,25 +65,57 @@ jobs:
 
           echo "keystore=$(base64 -w 0 pr-key.jks)" >> $GITHUB_OUTPUT
 
+      - name: Use production keystore metadata
+        if: github.event_name != 'pull_request'
+        id: gen_prod
+        env:
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PROD_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          test -n "$PROD_KEYSTORE"
+          test -n "$PROD_KEYSTORE_PASSWORD"
+          test -n "$PROD_KEY_ALIAS"
+          test -n "$PROD_KEY_PASSWORD"
+          echo "keystore=$PROD_KEYSTORE" >> $GITHUB_OUTPUT
+          echo "keystore_password=$PROD_KEYSTORE_PASSWORD" >> $GITHUB_OUTPUT
+          echo "key_password=$PROD_KEY_PASSWORD" >> $GITHUB_OUTPUT
+          echo "key_alias=$PROD_KEY_ALIAS" >> $GITHUB_OUTPUT
+
       - name: Extract certificate hash and size
-        if: github.event_name == 'pull_request'
         id: extract
         env:
-          STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_STORE_PASS: ${{ steps.gen.outputs.keystore_password }}
+          PROD_KEYSTORE: ${{ secrets.KEYSTORE }}
+          PROD_STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          PROD_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
-          # Export DER certificate
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            KEYSTORE_FILE=pr-key.jks
+            KEY_ALIAS=pr-key
+            STORE_PASS="$PR_STORE_PASS"
+          else
+            test -n "$PROD_KEYSTORE"
+            test -n "$PROD_STORE_PASS"
+            test -n "$PROD_KEY_ALIAS"
+            echo "$PROD_KEYSTORE" | base64 -d > key.jks
+            KEYSTORE_FILE=key.jks
+            KEY_ALIAS="$PROD_KEY_ALIAS"
+            STORE_PASS="$PROD_STORE_PASS"
+          fi
+
           keytool -exportcert \
-            -alias pr-key \
-            -keystore pr-key.jks \
+            -alias "$KEY_ALIAS" \
+            -keystore "$KEYSTORE_FILE" \
             -storepass "$STORE_PASS" \
             -file pr-cert.der
 
-          # Calculate size in hex
           SIZE_DEC=$(stat -c%s pr-cert.der)
           SIZE_HEX=$(printf '0x%04x' "$SIZE_DEC")
           echo "expected_size=$SIZE_HEX" >> $GITHUB_OUTPUT
 
-          # Calculate SHA256 hash
           HASH=$(sha256sum pr-cert.der | awk '{print $1}')
           echo "expected_hash=$HASH" >> $GITHUB_OUTPUT
 
@@ -89,15 +126,23 @@ jobs:
     needs: generate-key
     uses: ./.github/workflows/build-lkm.yml
     with:
-      expected_size2: ${{ needs.generate-key.outputs.expected_size || '' }}
-      expected_hash2: ${{ needs.generate-key.outputs.expected_hash || '' }}
+      expected_size: ${{ needs.generate-key.outputs.expected_size || '' }}
+      expected_hash: ${{ needs.generate-key.outputs.expected_hash || '' }}
+    secrets: inherit
+
+  build-lkm-vivo:
+    needs: generate-key
+    uses: ./.github/workflows/build-lkm-vivo.yml
+    with:
+      expected_size: ${{ needs.generate-key.outputs.expected_size || '' }}
+      expected_hash: ${{ needs.generate-key.outputs.expected_hash || '' }}
     secrets: inherit
 
   build-ksuinit:
     uses: ./.github/workflows/ksuinit.yml
 
   build-ksud:
-    needs: [build-lkm, build-ksuinit]
+    needs: [build-lkm, build-lkm-vivo, build-ksuinit]
     strategy:
       matrix:
         include:
@@ -110,7 +155,7 @@ jobs:
       pack_ksuinit: true
   
   build-ksud-extra:
-    needs: [build-lkm, build-ksuinit]
+    needs: [build-lkm, build-lkm-vivo, build-ksuinit]
     strategy:
       matrix:
         include:
@@ -146,7 +191,7 @@ jobs:
           fetch-depth: 0
 
       - name: Write key
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name != 'pull_request' }}
         run: |
           if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
             {
@@ -194,7 +239,7 @@ jobs:
           fi
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.ref_type == 'tag' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/ci' }}
         uses: actions/upload-artifact@v7
         with:
           name: manager-gradle
@@ -202,7 +247,7 @@ jobs:
 
       - name: Upload mappings
         uses: actions/upload-artifact@v7
-        if: ${{ ( github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' )) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name != 'pull_request' }}
         with:
           name: "mappings"
           path: "manager/app/build/outputs/mapping/release/"
@@ -265,7 +310,7 @@ jobs:
           cp -f "$X86_64_KSUD" target/x86_64-linux-android/release/ksud
 
       - name: Prepare signing inputs
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name != 'pull_request' }}
         env:
           PR_KEYSTORE: ${{ needs.generate-key.outputs.keystore }}
           PR_KEYSTORE_PASSWORD: ${{ needs.generate-key.outputs.keystore_password }}
@@ -291,7 +336,7 @@ jobs:
           fi
 
       - name: Repack and resign
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name != 'pull_request' }}
         run: |
           python3 repack_apk.py repack \
             -b release \
@@ -305,7 +350,7 @@ jobs:
             --strip
 
       - name: Upload build artifact
-        if: ${{ github.event_name == 'pull_request' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')) || github.ref_type == 'tag' }}
+        if: ${{ github.event_name == 'pull_request' || github.event_name != 'pull_request' }}
         uses: actions/upload-artifact@v7
         with:
           name: manager

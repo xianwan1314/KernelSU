@@ -12,20 +12,25 @@ on:
         required: false
         default: '20260313'
         type: string
-      expected_size2:
-        description: 'Second expected signature size (for PR builds)'
+      expected_size:
+        description: 'Expected Manager signature size'
         required: false
         default: ''
         type: string
-      expected_hash2:
-        description: 'Second expected signature hash (for PR builds)'
+      expected_hash:
+        description: 'Expected Manager signature hash'
         required: false
         default: ''
         type: string
+      vivo:
+        description: 'Inject vivo vermagic. When true, output is suffixed with _vivo.'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build-kernelsu-ko:
-    name: Build kernelsu.ko for ${{ inputs.kmi }}
+    name: Build kernelsu.ko for ${{ inputs.kmi }}${{ inputs.vivo && ' (vivo)' || '' }}
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
@@ -35,10 +40,58 @@ jobs:
     - name: Checkout source code
       uses: actions/checkout@v7
 
+    - name: Inject vivo vermagic
+      if: ${{ inputs.vivo }}
+      run: |
+        set -euo pipefail
+        KMI="${{ inputs.kmi }}"
+        ANDROID_VER=$(echo "$KMI" | cut -d- -f1 | sed 's/android//')
+        KERNEL_VER=$(echo "$KMI" | cut -d- -f2)
+
+        case "$KMI" in
+          android12-5.10|android13-5.10)
+            UTS_STRING="5.10.233-android12-9-g28b19682acbc-dirty"
+            PATCH_UTS="false"
+            ;;
+          android14-6.1)
+            UTS_STRING="6.1.145-android14-11-maybe-dirty"
+            PATCH_UTS="true"
+            ;;
+          *)
+            UTS_STRING="${KERNEL_VER}.0-android${ANDROID_VER}-0-maybe-dirty"
+            PATCH_UTS="true"
+            echo "WARNING: KMI=$KMI uses generic vivo vermagic template."
+            ;;
+        esac
+
+        VMAGIC_STRING="${UTS_STRING} SMP preempt mod_unload modversions vivo aarch64"
+        VERMAGIC_FILE=$(find /opt/ddk -path "*/include/linux/vermagic.h" | head -n 1)
+        if [ -z "$VERMAGIC_FILE" ]; then
+          echo "ERROR: vermagic.h not found under /opt/ddk"
+          exit 1
+        fi
+
+        {
+          echo ""
+          echo "#undef VERMAGIC_STRING"
+          echo "#define VERMAGIC_STRING \"$VMAGIC_STRING\""
+        } >> "$VERMAGIC_FILE"
+
+        if [ "$PATCH_UTS" = "true" ]; then
+          UTS_FILE=$(find /opt/ddk -path "*/include/generated/utsrelease.h" | head -n 1)
+          if [ -n "$UTS_FILE" ]; then
+            {
+              echo ""
+              echo "#undef UTS_RELEASE"
+              echo "#define UTS_RELEASE \"$UTS_STRING\""
+            } >> "$UTS_FILE"
+          fi
+        fi
+
     - name: Build kernelsu.ko
       env:
-        EXPECTED_SIZE2: ${{ inputs.expected_size2 }}
-        EXPECTED_HASH2: ${{ inputs.expected_hash2 }}
+        EXPECTED_SIZE: ${{ inputs.expected_size }}
+        EXPECTED_HASH: ${{ inputs.expected_hash }}
       run: |
         git config --global --add safe.directory /__w/KernelSU/KernelSU
 
@@ -47,16 +100,16 @@ jobs:
         echo "=== Building kernelsu.ko for KMI: ${{ inputs.kmi }} ==="
 
         EXTRA_ARGS=""
-        if [ -n "$EXPECTED_SIZE2" ] && [ -z "$EXPECTED_HASH2" ]; then
-          echo "ERROR: expected_hash2 must be provided when expected_size2 is set."
+        if [ -n "$EXPECTED_SIZE" ] && [ -z "$EXPECTED_HASH" ]; then
+          echo "ERROR: expected_hash must be provided when expected_size is set."
           exit 1
         fi
-        if [ -z "$EXPECTED_SIZE2" ] && [ -n "$EXPECTED_HASH2" ]; then
-          echo "ERROR: expected_size2 must be provided when expected_hash2 is set."
+        if [ -z "$EXPECTED_SIZE" ] && [ -n "$EXPECTED_HASH" ]; then
+          echo "ERROR: expected_size must be provided when expected_hash is set."
           exit 1
         fi
-        if [ -n "$EXPECTED_SIZE2" ]; then
-          EXTRA_ARGS="KSU_EXPECTED_SIZE2=$EXPECTED_SIZE2 KSU_EXPECTED_HASH2=$EXPECTED_HASH2"
+        if [ -n "$EXPECTED_SIZE" ]; then
+          EXTRA_ARGS="KSU_EXPECTED_SIZE=$EXPECTED_SIZE KSU_EXPECTED_HASH=$EXPECTED_HASH"
         fi
         CONFIG_KSU=m CC=clang make $EXTRA_ARGS
         
@@ -66,7 +119,11 @@ jobs:
         mkdir -p /github/workspace/out
 
         # Copy with KMI-specific naming
-        OUTPUT_NAME="${{ inputs.kmi }}_kernelsu.ko"
+        SUFFIX=""
+        if [ "${{ inputs.vivo }}" = "true" ]; then
+          SUFFIX="_vivo"
+        fi
+        OUTPUT_NAME="${{ inputs.kmi }}${SUFFIX}_kernelsu.ko"
         cp kernelsu.ko "/github/workspace/out/$OUTPUT_NAME"
         
         echo "Copied to: /github/workspace/out/$OUTPUT_NAME"
@@ -78,5 +135,5 @@ jobs:
     - name: Upload kernelsu.ko artifact
       uses: actions/upload-artifact@v7
       with:
-        name: ${{ inputs.kmi }}-lkm
-        path: /github/workspace/out/${{ inputs.kmi }}_kernelsu.ko
+        name: ${{ inputs.kmi }}${{ inputs.vivo && '-vivo' || '' }}-lkm
+        path: /github/workspace/out/${{ inputs.kmi }}${{ inputs.vivo && '_vivo' || '' }}_kernelsu.ko

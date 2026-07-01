@@ -112,6 +112,9 @@ enum Commands {
     /// Patch boot or init_boot images to apply KernelSU
     BootPatch(BootPatchArgs),
 
+    /// Patch vendor_boot for vivo devices and remove vr.ko related entries
+    BootPatchVivo(BootPatchArgs),
+
     /// Restore boot or init_boot images patched by KernelSU
     BootRestore(BootRestoreArgs),
 
@@ -153,6 +156,9 @@ enum BootInfo {
 
     /// show supported kmi versions
     SupportedKmis,
+
+    /// classify an image as vendor_boot / init_boot / unknown
+    ClassifyImage { image: PathBuf },
 
     /// check if device is A/B capable
     IsAbDevice,
@@ -722,6 +728,7 @@ pub fn run() -> Result<()> {
         },
 
         Commands::BootPatch(boot_patch) => crate::boot_patch::patch(boot_patch),
+        Commands::BootPatchVivo(boot_patch) => crate::boot_patch::patch_vivo(boot_patch),
 
         Commands::BootInfo { command } => match command {
             BootInfo::CurrentKmi => {
@@ -735,6 +742,11 @@ pub fn run() -> Result<()> {
                 for kmi in &kmi {
                     println!("{kmi}");
                 }
+                return Ok(());
+            }
+            BootInfo::ClassifyImage { image } => {
+                let kind = crate::boot_patch::classify_image(&image)?;
+                println!("{kind}");
                 return Ok(());
             }
             BootInfo::IsAbDevice => {

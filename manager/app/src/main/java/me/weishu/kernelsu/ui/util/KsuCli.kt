@@ -268,6 +268,7 @@ fun installBoot(
     lkm: LkmSelection,
     ota: Boolean,
     partition: String?,
+    bootImageKind: String?,
     allowShell: Boolean,
     enableAdb: Boolean,
     onStdout: (String) -> Unit,
@@ -286,7 +287,16 @@ fun installBoot(
         }
     }
 
-    var cmd = "boot-patch"
+    val isVendorBoot = isVendorBootTarget(bootImageKind, partition)
+    val targetName = describeBootTarget(bootImageKind, partition)
+    onStdout("[manager] received args: partition=${partition ?: "<null>"} imageKind=${bootImageKind ?: "<null>"} ota=$ota lkm=${lkm.javaClass.simpleName}")
+    if (isVendorBoot) {
+        onStdout("[manager] detected $targetName, removing vr.ko and related module references")
+    } else {
+        onStdout("[manager] detected $targetName, using vivo compat flow to inject KernelSU LKM")
+    }
+
+    var cmd = VIVO_BOOT_PATCH_COMMAND
 
     cmd += if (bootFile == null) {
         // no boot.img, use -f to flash
@@ -301,6 +311,10 @@ fun installBoot(
 
     if (enableAdb) {
         cmd += " --enable-adbd"
+    }
+
+    if (isVendorBoot) {
+        cmd += " --no-install"
     }
 
     if (ota) {
@@ -334,7 +348,14 @@ fun installBoot(
     if (bootFile != null) {
         val downloadsDir =
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val outputKind = resolveBootImageKindForOutput(bootImageKind, partition)
+        val outputName = if (outputKind == null) {
+            "kernelsu_patched_vivo_${System.currentTimeMillis()}.img"
+        } else {
+            "kernelsu_patched_${outputKind}_${System.currentTimeMillis()}.img"
+        }
         cmd += " -o $downloadsDir"
+        cmd += " --out-name $outputName"
     }
 
     partition?.let { part ->
@@ -386,6 +407,25 @@ suspend fun getSupportedKmis(): List<String> = withContext(Dispatchers.IO) {
     out.filter { it.isNotBlank() }.map { it.trim() }
 }
 
+suspend fun classifyBootImage(uri: Uri?): String = withContext(Dispatchers.IO) {
+    if (uri == null) return@withContext BOOT_IMAGE_KIND_UNKNOWN
+    detectBootImageKindByName(uri.getFileName(ksuApp))?.let { return@withContext it }
+
+    val resolver = ksuApp.contentResolver
+    val image = File(ksuApp.cacheDir, "boot-classify.img")
+    try {
+        resolver.openInputStream(uri)?.use { input ->
+            image.outputStream().use { output -> input.copyTo(output) }
+        } ?: return@withContext BOOT_IMAGE_KIND_UNKNOWN
+
+        val shell = getRootShell()
+        val cmd = "boot-info classify-image ${image.absolutePath}"
+        ShellUtils.fastCmd(shell, "${getKsuDaemonPath()} $cmd").trim().ifBlank { BOOT_IMAGE_KIND_UNKNOWN }
+    } finally {
+        image.delete()
+    }
+}
+
 suspend fun isAbDevice(): Boolean = withContext(Dispatchers.IO) {
     val shell = getRootShell()
     val cmd = "boot-info is-ab-device"
@@ -398,7 +438,7 @@ suspend fun getDefaultPartition(): String = withContext(Dispatchers.IO) {
         val cmd = "boot-info default-partition"
         ShellUtils.fastCmd(shell, "${getKsuDaemonPath()} $cmd").trim()
     } else {
-        if (!Os.uname().release.contains("android12-")) "init_boot" else "boot"
+        if (!Os.uname().release.contains("android12-")) BOOT_IMAGE_KIND_INIT_BOOT else BOOT_IMAGE_KIND_BOOT
     }
 }
 
