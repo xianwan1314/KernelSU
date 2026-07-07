@@ -18,6 +18,16 @@ use regex_lite::Regex;
 
 use crate::assets;
 
+// This branch targets the vivo-only patch flow, so boot-family names stay centralized.
+const BOOT_PARTITION_BOOT: &str = "boot";
+const BOOT_PARTITION_INIT_BOOT: &str = "init_boot";
+const BOOT_PARTITION_VENDOR_BOOT: &str = "vendor_boot";
+const BOOT_FAMILY_PARTITIONS: [&str; 3] = [
+    BOOT_PARTITION_BOOT,
+    BOOT_PARTITION_INIT_BOOT,
+    BOOT_PARTITION_VENDOR_BOOT,
+];
+
 #[cfg(target_os = "android")]
 mod android {
     use super::Result;
@@ -34,6 +44,10 @@ mod android {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    use super::{
+        BOOT_FAMILY_PARTITIONS, BOOT_PARTITION_BOOT, BOOT_PARTITION_INIT_BOOT,
+        BOOT_PARTITION_VENDOR_BOOT,
+    };
     use crate::utils;
 
     pub(super) fn ensure_gki_kernel() -> Result<()> {
@@ -76,6 +90,16 @@ mod android {
         Ok(format!("{android_version}-{kernel_version}"))
     }
 
+    const VIVO_KMI_SUFFIX: &str = "_vivo";
+
+    fn to_vivo_kmi_name(kmi: String) -> String {
+        if kmi.ends_with(VIVO_KMI_SUFFIX) {
+            kmi
+        } else {
+            format!("{kmi}{VIVO_KMI_SUFFIX}")
+        }
+    }
+
     fn parse_kmi_from_uname() -> Result<String> {
         let uname = rustix::system::uname();
         let version = uname.release().to_string_lossy();
@@ -99,8 +123,18 @@ mod android {
         bail!("Parse KMI from modules failed")
     }
 
-    pub fn get_current_kmi() -> Result<String> {
+    fn detect_current_base_kmi() -> Result<String> {
         parse_kmi_from_uname().or_else(|_| parse_kmi_from_modules())
+    }
+
+    fn detect_current_vivo_kmi() -> Result<String> {
+        detect_current_base_kmi().map(to_vivo_kmi_name)
+    }
+
+    pub fn get_current_kmi() -> Result<String> {
+        // This vivo branch only packages vivo-suffixed LKMs, so the detected KMI
+        // stays mapped to the corresponding asset name.
+        detect_current_vivo_kmi()
     }
 
     fn calculate_sha1(file_path: impl AsRef<Path>) -> Result<String> {
@@ -225,23 +259,27 @@ mod android {
     ) -> String {
         let slot_suffix = get_slot_suffix(false);
         let skip_init_boot = kmi.starts_with("android12-");
-        let init_boot_exist =
-            Path::new(&format!("/dev/block/by-name/init_boot{slot_suffix}")).exists();
+        let init_boot_exist = Path::new(&format!(
+            "/dev/block/by-name/{BOOT_PARTITION_INIT_BOOT}{slot_suffix}"
+        ))
+        .exists();
 
         // if specific partition is specified, use it
         if let Some(part) = partition {
             return match part.as_str() {
-                "boot" | "init_boot" | "vendor_boot" => part.clone(),
-                _ => "boot".to_string(),
+                BOOT_PARTITION_BOOT | BOOT_PARTITION_INIT_BOOT | BOOT_PARTITION_VENDOR_BOOT => {
+                    part.clone()
+                }
+                _ => BOOT_PARTITION_BOOT.to_string(),
             };
         }
 
         // if init_boot exists and not skipping it, use it
         if !is_replace_kernel && init_boot_exist && !skip_init_boot {
-            return "init_boot".to_string();
+            return BOOT_PARTITION_INIT_BOOT.to_string();
         }
 
-        "boot".to_string()
+        BOOT_PARTITION_BOOT.to_string()
     }
 
     pub fn get_slot_suffix(ota: bool) -> String {
@@ -258,8 +296,7 @@ mod android {
 
     pub fn list_available_partitions() -> Vec<String> {
         let slot_suffix = get_slot_suffix(false);
-        let candidates = vec!["boot", "init_boot", "vendor_boot"];
-        candidates
+        BOOT_FAMILY_PARTITIONS
             .into_iter()
             .filter(|name| Path::new(&format!("/dev/block/by-name/{name}{slot_suffix}")).exists())
             .map(ToString::to_string)
@@ -406,12 +443,232 @@ fn extract_ramdisk(ramdisk_image: &RamdiskImage) -> Result<(Cpio, Option<usize>)
     }
 }
 
+pub fn classify_image(image: &Path) -> Result<String> {
+    ensure!(image.exists(), "boot image not found");
+    let boot_image_data = map_file(image)?;
+    let boot_image = BootImage::parse(&boot_image_data)?;
+    enforce_bootimage_version(&boot_image)?;
+
+    let (cpio, _) = if let Some(ramdisk_image) = boot_image.get_blocks().get_ramdisk() {
+        extract_ramdisk(ramdisk_image)?
+    } else {
+        (Cpio::new(), None)
+    };
+
+    let kind = if cpio
+        .entries()
+        .keys()
+        .any(|path| is_kernel_module_path(path))
+    {
+        BOOT_PARTITION_VENDOR_BOOT
+    } else {
+        BOOT_PARTITION_INIT_BOOT
+    };
+
+    Ok(kind.to_string())
+}
+
 fn enforce_bootimage_version(boot: &BootImage<'_>) -> Result<()> {
     if let BootImageVersion::Android(ver) = boot.get_header().get_version()
         && ver < 3
     {
         bail!("bootimage version {ver} is not supported!")
     }
+    Ok(())
+}
+
+fn normalize_module_name(name: &str) -> String {
+    let trimmed = name.trim().trim_matches('/');
+    let file_name = Path::new(trimmed)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(trimmed);
+    file_name.to_string()
+}
+
+fn is_kernel_module_path(path: &str) -> bool {
+    path.starts_with("lib/modules/")
+        && Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ko"))
+}
+
+fn detect_boot_image_kind_by_name(path: &Path) -> Option<&'static str> {
+    let normalized = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if normalized.ends_with(&format!("{BOOT_PARTITION_VENDOR_BOOT}.img")) {
+        Some(BOOT_PARTITION_VENDOR_BOOT)
+    } else if normalized.ends_with(&format!("{BOOT_PARTITION_INIT_BOOT}.img")) {
+        Some(BOOT_PARTITION_INIT_BOOT)
+    } else if normalized.ends_with(&format!("{BOOT_PARTITION_BOOT}.img")) {
+        Some(BOOT_PARTITION_BOOT)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "android")]
+fn resolve_boot_image_kind_for_output(
+    image_file: Option<&Path>,
+    partition: Option<&str>,
+) -> Option<String> {
+    image_file
+        .and_then(detect_boot_image_kind_by_name)
+        .map(str::to_string)
+        .or_else(|| {
+            partition
+                .filter(|value| BOOT_FAMILY_PARTITIONS.contains(value))
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            image_file.and_then(|path| {
+                classify_image(path)
+                    .ok()
+                    .filter(|kind| BOOT_FAMILY_PARTITIONS.contains(&kind.as_str()))
+            })
+        })
+}
+
+#[cfg(not(target_os = "android"))]
+fn resolve_boot_image_kind_for_output(
+    image_file: Option<&Path>,
+    _partition: Option<&str>,
+) -> Option<String> {
+    image_file
+        .and_then(detect_boot_image_kind_by_name)
+        .map(str::to_string)
+        .or_else(|| {
+            image_file.and_then(|path| {
+                classify_image(path)
+                    .ok()
+                    .filter(|kind| BOOT_FAMILY_PARTITIONS.contains(&kind.as_str()))
+            })
+        })
+}
+
+fn build_patched_output_name(kind: Option<&str>) -> String {
+    let now = chrono::Utc::now();
+    match kind {
+        Some(kind) => format!(
+            "kernelsu_patched_{}_{}.img",
+            kind,
+            now.format("%Y%m%d_%H%M%S")
+        ),
+        None => format!("kernelsu_patched_{}.img", now.format("%Y%m%d_%H%M%S")),
+    }
+}
+
+fn build_restore_output_name(kind: Option<&str>) -> String {
+    let now = chrono::Utc::now();
+    match kind {
+        Some(kind) => format!(
+            "kernelsu_restore_{}_{}.img",
+            kind,
+            now.format("%Y%m%d_%H%M%S")
+        ),
+        None => format!("kernelsu_restore_{}.img", now.format("%Y%m%d_%H%M%S")),
+    }
+}
+
+fn remove_module_from_index(cpio: &mut Cpio, index_path: &str, module_name: &str) -> Result<()> {
+    let Some(entry) = cpio.entry_by_name(index_path) else {
+        return Ok(());
+    };
+    let Some(data) = entry.data() else {
+        return Ok(());
+    };
+    let text = std::str::from_utf8(data)?;
+    let module_stem = module_name.trim_end_matches(".ko");
+    let mut changed = false;
+    let mut kept = Vec::<String>::new();
+
+    for line in text.lines() {
+        let value = line.trim();
+        if value.is_empty() {
+            continue;
+        }
+
+        let refs_by_path =
+            value.contains(module_name) || value.contains(&format!("/{module_name}"));
+        let refs_by_stem = value.contains(&format!(" {module_stem} "))
+            || value.ends_with(&format!(" {module_stem}"))
+            || value.starts_with(&format!("{module_stem} "))
+            || value.starts_with(&format!("softdep {module_stem} "));
+
+        if refs_by_path || refs_by_stem {
+            changed = true;
+            continue;
+        }
+
+        kept.push(line.to_string());
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    println!("- Cleaning reference in {index_path} for {module_name}");
+    let mut rebuilt = kept.join("\n");
+    if !rebuilt.is_empty() {
+        rebuilt.push('\n');
+    }
+
+    cpio.rm(index_path, false);
+    cpio.add(
+        index_path,
+        CpioEntry::regular(0o644, Box::new(rebuilt.into_bytes())),
+    )?;
+    Ok(())
+}
+
+fn remove_vendor_modules(cpio: &mut Cpio, remove_module: &[String]) -> Result<()> {
+    if remove_module.is_empty() {
+        return Ok(());
+    }
+
+    let mut module_roots: Vec<String> = vec!["lib/modules".to_string()];
+    let prefix = "lib/modules/";
+    for path in cpio.entries().keys() {
+        let Some(rest) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        let head = rest.find('/').map_or(rest, |idx| &rest[..idx]);
+        if head.is_empty() || !head.ends_with("-gki") {
+            continue;
+        }
+        let candidate = format!("{prefix}{head}");
+        if !module_roots.iter().any(|root| root == &candidate) {
+            println!("- Detected vendor module root: {candidate}");
+            module_roots.push(candidate);
+        }
+    }
+
+    let index_files = [
+        "modules.load",
+        "modules.dep",
+        "modules.softdep",
+        "modules.load.recovery",
+    ];
+
+    for raw_name in remove_module {
+        let module_name = normalize_module_name(raw_name);
+        if module_name.is_empty() {
+            continue;
+        }
+
+        for root in &module_roots {
+            let module_path = format!("{root}/{module_name}");
+            if cpio.exists(&module_path) {
+                println!("- Removing vendor module {module_path}");
+                cpio.rm(&module_path, false);
+            }
+
+            for index in index_files {
+                let index_path = format!("{root}/{index}");
+                remove_module_from_index(cpio, &index_path, &module_name)?;
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -504,6 +761,30 @@ pub struct BootPatchArgs {
     /// Do not load custom rc
     #[arg(long, default_value = "false")]
     no_custom_rc: bool,
+
+    /// Remove matching vendor ramdisk modules and their index references
+    #[arg(long = "remove-module", value_name = "MODULE")]
+    pub remove_module: Vec<String>,
+}
+
+pub fn patch_vivo(mut args: BootPatchArgs) -> Result<()> {
+    const VIVO_REMOVE_MODULES: &[&str] = &["vr.ko"];
+
+    // This entry point keeps the current branch behavior explicit: one vivo-only
+    // flow that patches boot/init_boot and vendor_boot with the same command.
+    println!("- Mode: vivo compat (auto-detect init_boot vs vendor_boot)");
+
+    for module in VIVO_REMOVE_MODULES {
+        if !args
+            .remove_module
+            .iter()
+            .any(|value| normalize_module_name(value) == *module)
+        {
+            args.remove_module.push((*module).to_string());
+        }
+    }
+
+    patch(args)
 }
 
 pub fn patch(args: BootPatchArgs) -> Result<()> {
@@ -520,7 +801,7 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             allow_shell,
             enable_adbd,
             adb_debug_prop,
-            no_install,
+            mut no_install,
             #[cfg(target_os = "android")]
             ota,
             #[cfg(target_os = "android")]
@@ -530,6 +811,7 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             #[cfg(target_os = "android")]
             partition,
             no_custom_rc,
+            remove_module,
         } = args;
 
         println!(include_str!("banner"));
@@ -551,11 +833,46 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             );
         }
 
-        let kmi = kmi.map_or_else(
-            || -> Result<_> {
-                if kmod.is_some() {
-                    return Ok(String::new());
-                }
+        let image_file = if let Some(image) = image.as_ref() {
+            ensure!(image.exists(), "boot image not found");
+            Some(std::fs::canonicalize(image)?)
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "android")]
+        let is_vendor_boot_target = if partition.as_deref() == Some(BOOT_PARTITION_VENDOR_BOOT) {
+            true
+        } else if let Some(image_path) = image_file.as_ref() {
+            classify_image(image_path)? == BOOT_PARTITION_VENDOR_BOOT
+        } else {
+            false
+        };
+
+        #[cfg(not(target_os = "android"))]
+        let is_vendor_boot_target = image_file.as_ref().is_some_and(|image_path| {
+            classify_image(image_path).is_ok_and(|kind| kind == BOOT_PARTITION_VENDOR_BOOT)
+        });
+
+        if is_vendor_boot_target && !is_replace_kernel {
+            if !no_install {
+                println!(
+                    "- Auto-detected vendor_boot target before KMI parsing; skipping LKM injection"
+                );
+            }
+            no_install = true;
+        }
+
+        let should_skip_kmi = is_vendor_boot_target && !is_replace_kernel && kmod.is_none();
+
+        let kmi = if should_skip_kmi {
+            kmi.unwrap_or_default()
+        } else {
+            kmi.map_or_else(
+                || -> Result<_> {
+                    if kmod.is_some() {
+                        return Ok(String::new());
+                    }
                 #[cfg(target_os = "android")]
                 if ota {
                     let slot_suffix = get_slot_suffix(true);
@@ -564,47 +881,53 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
                         "/dev/block/by-name/boot{slot_suffix}"
                     )));
                 }
-                #[cfg(target_os = "android")]
-                match get_current_kmi() {
-                    Ok(value) => {
-                        return Ok(value);
+                    #[cfg(target_os = "android")]
+                    match get_current_kmi() {
+                        Ok(value) => {
+                            return Ok(value);
+                        }
+                        Err(e) => {
+                            println!("- {e}");
+                        }
                     }
-                    Err(e) => {
-                        println!("- {e}");
-                    }
-                }
-                Ok(if let Some(image_path) = &image {
-                    println!(
-                        "- Trying to auto detect KMI version for {}",
-                        image_path.display()
-                    );
-                    parse_kmi_from_boot(image_path)?
-                } else if let Some(kernel_path) = &kernel {
-                    println!(
-                        "- Trying to auto detect KMI version for {}",
-                        kernel_path.display()
-                    );
-                    parse_kmi_from_kernel(kernel_path)?
-                } else {
-                    String::new()
-                })
-            },
-            Ok,
-        )?;
-
-        let boot_image_file = if let Some(image) = image {
-            ensure!(image.exists(), "boot image not found");
-            std::fs::canonicalize(image)?
-        } else {
-            #[cfg(target_os = "android")]
-            {
-                auto_boot_partition_path(&kmi, ota, is_replace_kernel, &partition)
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                bail!("Please specify a boot image");
-            }
+                    Ok(if let Some(image_path) = image_file.as_ref() {
+                        println!(
+                            "- Trying to auto detect KMI version for {}",
+                            image_path.display()
+                        );
+                        parse_kmi_from_boot(image_path)?
+                    } else if let Some(kernel_path) = &kernel {
+                        println!(
+                            "- Trying to auto detect KMI version for {}",
+                            kernel_path.display()
+                        );
+                        parse_kmi_from_kernel(kernel_path)?
+                    } else {
+                        String::new()
+                    })
+                },
+                Ok,
+            )?
         };
+
+        let boot_image_file = image_file.as_ref().map_or_else(
+            || {
+                #[cfg(target_os = "android")]
+                {
+                    Ok::<PathBuf, anyhow::Error>(auto_boot_partition_path(
+                        &kmi,
+                        ota,
+                        is_replace_kernel,
+                        &partition,
+                    ))
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    bail!("Please specify a boot image");
+                }
+            },
+            |path| Ok(path.clone()),
+        )?;
 
         #[cfg(target_os = "android")]
         println!("- Bootdevice: {}", boot_image_file.display());
@@ -657,6 +980,19 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
                 println!("- No ramdisk, create by default");
                 (Cpio::new(), None)
             };
+
+        if !no_install {
+            let looks_like_vendor = cpio
+                .entries()
+                .keys()
+                .any(|path| is_kernel_module_path(path));
+            if looks_like_vendor {
+                println!(
+                    "- Auto-detected vendor_boot (lib/modules/*.ko present); skipping LKM injection"
+                );
+                no_install = true;
+            }
+        }
 
         if !no_install {
             ensure!(
@@ -746,6 +1082,8 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             }
         }
 
+        remove_vendor_modules(&mut cpio, &remove_module)?;
+
         let mut new_cpio = Vec::<u8>::new();
         cpio.dump(&mut new_cpio)?;
 
@@ -782,10 +1120,18 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
 
         if should_write_output {
             let output_dir = out.unwrap_or(std::env::current_dir()?);
-            let name = out_name.unwrap_or_else(|| {
-                let now = chrono::Utc::now();
-                format!("kernelsu_patched_{}.img", now.format("%Y%m%d_%H%M%S"))
+            let output_kind = resolve_boot_image_kind_for_output(image_file.as_deref(), {
+                #[cfg(target_os = "android")]
+                {
+                    partition.as_deref()
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    None
+                }
             });
+            let name =
+                out_name.unwrap_or_else(|| build_patched_output_name(output_kind.as_deref()));
             let output_image = output_dir.join(name);
             std::fs::write(&output_image, &new_boot_bytes).context("write out new boot failed")?;
             println!("- Output file is written to");
@@ -951,10 +1297,8 @@ pub fn restore(args: BootRestoreArgs) -> Result<()> {
 
     if should_write_output {
         let output_dir = out.unwrap_or(std::env::current_dir()?);
-        let name = out_name.unwrap_or_else(|| {
-            let now = chrono::Utc::now();
-            format!("kernelsu_restore_{}.img", now.format("%Y%m%d_%H%M%S"))
-        });
+        let output_kind = resolve_boot_image_kind_for_output(Some(&boot_image_file), None);
+        let name = out_name.unwrap_or_else(|| build_restore_output_name(output_kind.as_deref()));
         let output_image = output_dir.join(name);
         std::fs::write(&output_image, &new_boot_bytes).context("copy out new boot failed")?;
         println!("- Output file is written to");

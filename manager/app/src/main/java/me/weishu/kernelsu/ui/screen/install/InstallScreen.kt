@@ -29,6 +29,9 @@ import me.weishu.kernelsu.ui.component.choosekmidialog.ChooseKmiDialog
 import me.weishu.kernelsu.ui.navigation3.LocalNavigator
 import me.weishu.kernelsu.ui.navigation3.Route
 import me.weishu.kernelsu.ui.screen.flash.FlashIt
+import me.weishu.kernelsu.ui.util.classifyBootImage
+import me.weishu.kernelsu.ui.util.isSupportedBootImageKind
+import me.weishu.kernelsu.ui.util.isVendorBootTarget
 import me.weishu.kernelsu.ui.util.LkmSelection
 import me.weishu.kernelsu.ui.util.getAvailablePartitions
 import me.weishu.kernelsu.ui.util.getCurrentKmi
@@ -55,6 +58,7 @@ fun InstallScreen() {
     var allowShell by rememberSaveable { mutableStateOf(false) }
     var enableAdb by rememberSaveable { mutableStateOf(false) }
     var forceBackup by rememberSaveable { mutableStateOf(false) }
+    var selectedBootImageKind by rememberSaveable { mutableStateOf<String?>(null) }
 
     val currentKmi by produceState(initialValue = "") { value = getCurrentKmi() }
     val partitions by produceState(initialValue = emptyList()) { value = getAvailablePartitions() }
@@ -113,6 +117,7 @@ fun InstallScreen() {
                         lkm = lkmSelection,
                         ota = method is InstallMethod.DirectInstallToInactiveSlot,
                         partition = partitions.getOrNull(partitionSelectionIndex),
+                        bootImageKind = selectedBootImageKind,
                         allowShell = allowShell,
                         enableAdb = enableAdb,
                         backup = method is InstallMethod.SelectFile && forceBackup
@@ -122,8 +127,12 @@ fun InstallScreen() {
         }
     }
 
+    val preferredKmi = currentKmi.takeIf { it.isNotBlank() }
+
     ChooseKmiDialog(
         show = showChooseKmiDialog.value,
+        preferredKmi = preferredKmi,
+        currentKmi = currentKmi,
         onDismissRequest = { showChooseKmiDialog.value = false },
         onSelected = { kmi ->
             kmi?.let {
@@ -153,7 +162,21 @@ fun InstallScreen() {
         if (it.resultCode == Activity.RESULT_OK) {
             it.data?.data?.let { uri ->
                 installMethod = InstallMethod.SelectFile(uri, summary = if (isGkiDevice) selectFileTip else selectFileTipNoGki)
+                selectedBootImageKind = null
             }
+        }
+    }
+
+    val continueInstall: () -> Unit = {
+        val isLkmSelected = lkmSelection != LkmSelection.KmiNone
+        val isKmiUnknown = currentKmi.isBlank()
+        val isSelectFileMode = installMethod is InstallMethod.SelectFile
+        val selectedPartition = partitions.getOrNull(partitionSelectionIndex)
+        val isVendorBoot = isVendorBootTarget(selectedBootImageKind, selectedPartition)
+        if (!isLkmSelected && (isKmiUnknown || isSelectFileMode) && !isVendorBoot) {
+            showChooseKmiDialog.value = true
+        } else {
+            onInstall()
         }
     }
 
@@ -174,7 +197,12 @@ fun InstallScreen() {
     )
     val actions = InstallScreenActions(
         onBack = dropUnlessResumed { navigator.pop() },
-        onSelectMethod = { method -> installMethod = method },
+        onSelectMethod = { method ->
+            installMethod = method
+            if (method !is InstallMethod.SelectFile) {
+                selectedBootImageKind = null
+            }
+        },
         onSelectBootImage = {
             selectImageLauncher.launch(Intent(Intent.ACTION_GET_CONTENT).apply { type = "application/octet-stream" })
         },
@@ -187,13 +215,28 @@ fun InstallScreen() {
             partitionSelectionIndex = index
         },
         onNext = {
-            val isLkmSelected = lkmSelection != LkmSelection.KmiNone
-            val isKmiUnknown = currentKmi.isBlank()
-            val isSelectFileMode = installMethod is InstallMethod.SelectFile
-            if (!isLkmSelected && (isKmiUnknown || isSelectFileMode)) {
-                showChooseKmiDialog.value = true
+            if (installMethod is InstallMethod.SelectFile && selectedBootImageKind == null) {
+                scope.launch {
+                    selectedBootImageKind = classifyBootImage((installMethod as? InstallMethod.SelectFile)?.uri)
+                    if (!isSupportedBootImageKind(selectedBootImageKind)) {
+                        showMessage(resources.getString(R.string.install_only_support_boot_family_image))
+                    } else {
+                        continueInstall()
+                    }
+                }
             } else {
-                onInstall()
+                val selectedPartition = partitions.getOrNull(partitionSelectionIndex)
+                if (installMethod is InstallMethod.SelectFile) {
+                    if (!isSupportedBootImageKind(selectedBootImageKind)) {
+                        showMessage(resources.getString(R.string.install_only_support_boot_family_image))
+                    } else {
+                        continueInstall()
+                    }
+                } else if (!isSupportedBootImageKind(selectedPartition)) {
+                    showMessage(resources.getString(R.string.install_only_support_boot_family_partition))
+                } else {
+                    continueInstall()
+                }
             }
         },
         onAdvancedOptionsClicked = {

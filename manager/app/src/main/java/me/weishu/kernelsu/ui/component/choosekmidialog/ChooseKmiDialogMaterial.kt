@@ -17,12 +17,15 @@ import androidx.compose.ui.unit.dp
 import me.weishu.kernelsu.R
 import me.weishu.kernelsu.ui.component.material.SegmentedColumn
 import me.weishu.kernelsu.ui.component.material.SegmentedRadioItem
-import me.weishu.kernelsu.ui.util.getCurrentKmi
+import me.weishu.kernelsu.ui.util.filterVivoKmis
 import me.weishu.kernelsu.ui.util.getSupportedKmis
+import me.weishu.kernelsu.ui.util.preferVivoKmi
 
 @Composable
 fun ChooseKmiDialogMaterial(
     show: Boolean,
+    preferredKmi: String? = null,
+    currentKmi: String = "",
     onDismissRequest: () -> Unit,
     onSelected: (String?) -> Unit
 ) {
@@ -32,16 +35,25 @@ fun ChooseKmiDialogMaterial(
         value = getSupportedKmis()
     }
 
-    val currentKmi by produceState(initialValue = "") {
-        value = getCurrentKmi()
+    val orderedKMIs = remember(supportedKMIs) {
+        filterVivoKmis(supportedKMIs)
     }
 
-    val selectedKmi = remember(currentKmi) { mutableStateOf(currentKmi) }
+    val preferred = remember(preferredKmi, currentKmi) {
+        preferVivoKmi(preferredKmi, currentKmi)
+    }
+    val selectedKmi = remember(currentKmi, preferred, orderedKMIs) {
+        mutableStateOf(
+            orderedKMIs.firstOrNull { it == preferred }
+                ?: orderedKMIs.firstOrNull()
+                ?: preferred
+        )
+    }
 
     AlertDialog(
         onDismissRequest = {
             onDismissRequest()
-            selectedKmi.value = currentKmi
+            selectedKmi.value = preferred
         },
         confirmButton = {
             TextButton(
@@ -49,7 +61,7 @@ fun ChooseKmiDialogMaterial(
                     onSelected(selectedKmi.value)
                     onDismissRequest()
                 },
-                enabled = supportedKMIs.contains(selectedKmi.value)
+                enabled = orderedKMIs.contains(selectedKmi.value)
             ) {
                 Text(stringResource(id = R.string.confirm))
             }
@@ -57,7 +69,7 @@ fun ChooseKmiDialogMaterial(
         dismissButton = {
             TextButton(onClick = {
                 onDismissRequest()
-                selectedKmi.value = currentKmi
+                selectedKmi.value = preferred
             }) {
                 Text(stringResource(id = android.R.string.cancel))
             }
@@ -73,11 +85,11 @@ fun ChooseKmiDialogMaterial(
         },
         text = {
             SegmentedColumn(
-                content = supportedKMIs.map { kmi ->
+                content = orderedKMIs.map { kmi ->
                     {
                         SegmentedRadioItem(
                             title = kmi,
-                            summary = if (kmi == currentKmi) stringResource(R.string.current_device_kmi) else null,
+                            summary = if (kmi == preferred) stringResource(R.string.current_device_kmi) else null,
                             selected = selectedKmi.value == kmi,
                             onClick = { selectedKmi.value = kmi }
                         )

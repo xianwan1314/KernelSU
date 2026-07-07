@@ -15,14 +15,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import me.weishu.kernelsu.R
-import me.weishu.kernelsu.ui.util.getCurrentKmi
+import me.weishu.kernelsu.ui.util.filterVivoKmis
 import me.weishu.kernelsu.ui.util.getSupportedKmis
+import me.weishu.kernelsu.ui.util.preferVivoKmi
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
@@ -32,32 +34,43 @@ import top.yukonga.miuix.kmp.preference.CheckboxPreference
 @Composable
 fun ChooseKmiDialogMiuix(
     show: Boolean,
+    preferredKmi: String? = null,
+    currentKmi: String = "",
     onDismissRequest: () -> Unit,
     onSelected: (String?) -> Unit
 ) {
     val supportedKMIs by produceState(initialValue = emptyList()) {
         value = getSupportedKmis()
     }
-    val currentKmi by produceState(initialValue = "") {
-        value = getCurrentKmi()
+    val orderedKMIs = rememberSaveable(supportedKMIs) {
+        filterVivoKmis(supportedKMIs)
     }
-    val currentSelection = rememberSaveable(currentKmi) { mutableStateOf(currentKmi) }
+    val preferred = remember(preferredKmi, currentKmi) {
+        preferVivoKmi(preferredKmi, currentKmi)
+    }
+    val currentSelection = rememberSaveable(currentKmi, preferred, orderedKMIs) {
+        mutableStateOf(
+            orderedKMIs.firstOrNull { it == preferred }
+                ?: orderedKMIs.firstOrNull()
+                ?: preferred
+        )
+    }
     OverlayDialog(
         show = show,
         title = stringResource(R.string.select_kmi),
         summary = stringResource(R.string.current_kmi, currentKmi.let { it.ifBlank { "Unknown" } }),
         onDismissRequest = {
             onDismissRequest()
-            currentSelection.value = currentKmi
+            currentSelection.value = preferred
         },
         insideMargin = DpSize(0.dp, 24.dp),
         content = {
             Column(modifier = Modifier.heightIn(max = 500.dp)) {
                 LazyColumn(modifier = Modifier.weight(1f, fill = false)) {
-                    items(supportedKMIs) { kmi ->
+                    items(orderedKMIs) { kmi ->
                         CheckboxPreference(
                             title = kmi,
-                            summary = if (kmi == currentKmi) stringResource(R.string.current_device_kmi) else null,
+                            summary = if (kmi == preferred) stringResource(R.string.current_device_kmi) else null,
                             insideMargin = PaddingValues(horizontal = 30.dp, vertical = 16.dp),
                             checkboxLocation = CheckboxLocation.End,
                             checked = currentSelection.value == kmi,
@@ -76,14 +89,14 @@ fun ChooseKmiDialogMiuix(
                     TextButton(
                         onClick = {
                             onDismissRequest()
-                            currentSelection.value = currentKmi
+                            currentSelection.value = preferred
                         },
                         text = stringResource(android.R.string.cancel),
                         modifier = Modifier.weight(1f),
                     )
                     Spacer(modifier = Modifier.width(20.dp))
                     TextButton(
-                        enabled = supportedKMIs.contains(currentSelection.value),
+                        enabled = orderedKMIs.contains(currentSelection.value),
                         onClick = {
                             onSelected(currentSelection.value)
                             onDismissRequest()
