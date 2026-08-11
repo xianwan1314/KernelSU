@@ -67,6 +67,9 @@ pub fn list_supported_kmi() -> std::vec::Vec<std::string::String> {
     for file in Asset::iter() {
         // kmi_name = "xxx_kernelsu.ko"
         if let Some(kmi) = file.strip_suffix("_kernelsu.ko") {
+            if kmi.ends_with("_vivo") {
+                continue;
+            }
             list.push(kmi.to_string());
         }
     }

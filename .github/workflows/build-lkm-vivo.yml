@@ -1,4 +1,4 @@
-name: Build LKM for KernelSU
+name: Build LKM for KernelSU (vivo)
 on:
   workflow_call:
     inputs:
@@ -14,7 +14,7 @@ on:
         type: string
   workflow_dispatch:
 jobs:
-  build-lkm:
+  build-lkm-vivo:
     strategy:
       matrix:
         kmi:
@@ -29,5 +29,6 @@ jobs:
     with:
       kmi: ${{ matrix.kmi }}
       ddk_release: '20260313'
+      vivo: true
       expected_size: ${{ inputs.expected_size || '' }}
       expected_hash: ${{ inputs.expected_hash || '' }}

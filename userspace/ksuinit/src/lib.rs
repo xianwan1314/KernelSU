@@ -1,12 +1,17 @@
 use anyhow::{Context, Result, bail};
 use goblin::elf::{Elf, section_header, sym::Sym};
-use rustix::system::init_module;
 use scroll::{Pwrite, ctx::SizeWith};
 use std::collections::HashMap;
 use std::ffi::CStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+#[cfg(unix)]
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use syscalls::{Sysno, syscall};
 
 struct Kptr {
     value: String,
@@ -44,8 +49,6 @@ pub fn kernel_symbols_iter() -> Result<impl Iterator<Item = (String, u64)>> {
 
     let iter = BufReader::new(File::open("/proc/kallsyms")?)
         .lines()
-        // https://github.com/torvalds/linux/blob/7f87a5ea75f011d2c9bc8ac0167e5e2d1adb1594/kernel/kallsyms.c#L727
-        // We can stop read as soon as we read all kernel symbols
         .map_while(|line| {
             line.ok().and_then(|line| {
                 let mut splits = line.split_whitespace();
@@ -55,7 +58,7 @@ pub fn kernel_symbols_iter() -> Result<impl Iterator<Item = (String, u64)>> {
                     .and_then(|addr| {
                         splits
                             .nth(1)
-                            .take_if(|_| splits.next().is_none()) // stop at module symbols
+                            .take_if(|_| splits.next().is_none())
                             .map(|symbol| {
                                 (
                                     symbol
@@ -83,55 +86,225 @@ pub fn for_each_kernel_symbols<F: FnMut(&(String, u64)) -> Result<bool>>(mut f: 
     Ok(())
 }
 
-const O_NONBLOCK: i32 = 0x800;
+pub fn load_module(data: &[u8], params: &CStr) -> Result<()> {
+    load_module_inner(data, "module", None, params)
+}
 
-fn open_kmsg_at_end() -> Result<File> {
-    let mut last_error = None;
+pub fn load_module_with_vermagic_fallback(
+    data: &[u8],
+    fallback_data: Option<&[u8]>,
+    params: &CStr,
+) -> Result<()> {
+    load_module_inner(
+        data,
+        "primary module",
+        fallback_data.map(|data| (data, "fallback module")),
+        params,
+    )
+}
 
-    for path in ["/dev/kmsg", "/kmsg"] {
-        match OpenOptions::new()
-            .read(true)
-            .custom_flags(O_NONBLOCK)
-            .open(path)
-        {
-            Ok(mut file) => {
-                file.seek(SeekFrom::End(0))
-                    .with_context(|| format!("Cannot seek {path} to end"))?;
+pub fn load_module_with_named_vermagic_fallback(
+    data: &[u8],
+    primary_name: &str,
+    fallback: Option<(&[u8], &str)>,
+    params: &CStr,
+) -> Result<()> {
+    load_module_inner(data, primary_name, fallback, params)
+}
 
-                log::info!("Reading kernel log from {path}");
-                return Ok(file);
-            }
-            Err(error) => {
-                last_error = Some((path, error));
-            }
+fn load_module_inner(
+    data: &[u8],
+    module_name: &str,
+    fallback: Option<(&[u8], &str)>,
+    params: &CStr,
+) -> Result<()> {
+    let mut buffer = data.to_vec();
+    let elf = Elf::parse(&buffer)?;
+    let ctx = *elf.syms.ctx();
+
+    let mut unresolved_symbols: HashMap<String, (Sym, usize)> = HashMap::new();
+    for (index, sym) in elf.syms.iter().enumerate() {
+        if index == 0 {
+            continue;
         }
+
+        if sym.st_shndx != section_header::SHN_UNDEF as usize {
+            continue;
+        }
+
+        let Some(name) = elf.strtab.get_at(sym.st_name) else {
+            continue;
+        };
+
+        let offset = elf.syms.offset() + index * Sym::size_with(elf.syms.ctx());
+        unresolved_symbols.insert(name.to_owned(), (sym, offset));
     }
 
-    match last_error {
-        Some((path, error)) => {
-            Err(error).with_context(|| format!("Cannot open kernel log device, last tried {path}"))
+    if !unresolved_symbols.is_empty() {
+        for_each_kernel_symbols(|(symbol, addr)| {
+            if let Some((mut sym, offset)) = unresolved_symbols.remove(symbol) {
+                sym.st_shndx = section_header::SHN_ABS as usize;
+                sym.st_value = *addr;
+                buffer.pwrite_with(sym, offset, ctx)?;
+            }
+
+            Ok(!unresolved_symbols.is_empty())
+        })
+        .context("Cannot parse kallsyms")?;
+    }
+
+    for name in unresolved_symbols.keys() {
+        log::warn!("Cannot find symbol: {}", name);
+    }
+
+    let mut kmsg = match open_kmsg_at_end() {
+        Ok(file) => Some(file),
+        Err(error) => {
+            log::warn!("Cannot prepare kmsg fallback: {error:#}");
+            None
         }
-        None => bail!("No kernel log device candidate"),
+    };
+
+    match do_init_module(&buffer, params) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            log::warn!(
+                "init_module failed for {} on first attempt: {:?}",
+                module_name,
+                first_error
+            );
+
+            let logs = match kmsg.as_mut() {
+                Some(file) => read_new_kmsg(file).unwrap_or_default(),
+                None => String::new(),
+            };
+
+            let Some(required_vermagic) = extract_required_vermagic(&logs) else {
+                log::error!(
+                    "init_module failed without a version-magic mismatch. Kernel log:\n{}",
+                    logs
+                );
+                return Err(anyhow::anyhow!("init_module failed: {:?}", first_error));
+            };
+
+            log::warn!(
+                "Kernel requires vermagic {:?} while loading {}",
+                required_vermagic,
+                module_name
+            );
+
+            if let Some((fallback_data, fallback_name)) = fallback {
+                log::warn!(
+                    "Version-magic mismatch for {}; switching to fallback {}",
+                    module_name,
+                    fallback_name
+                );
+                load_module_inner(fallback_data, fallback_name, None, params)
+                    .with_context(|| format!("Fallback module load failed for {fallback_name}"))?;
+                log::info!(
+                    "Fallback module {} loaded successfully after {} vermagic mismatch",
+                    fallback_name,
+                    module_name
+                );
+                return Ok(());
+            }
+
+            log::warn!(
+                "No fallback module for {}; patching vermagic in-place and retrying",
+                module_name
+            );
+            replace_module_vermagic(&mut buffer, &required_vermagic)
+                .context("Cannot replace module vermagic")?;
+
+            do_init_module(&buffer, params).map_err(|error| {
+                anyhow::anyhow!("init_module failed after replacing vermagic: {:?}", error)
+            })?;
+            log::info!(
+                "Loaded {} successfully after in-place vermagic replacement",
+                module_name
+            );
+            Ok(())
+        }
+    }
+}
+
+fn do_init_module(buffer: &[u8], params: &CStr) -> std::result::Result<(), syscalls::Errno> {
+    unsafe {
+        syscall!(
+            Sysno::init_module,
+            buffer.as_ptr(),
+            buffer.len(),
+            params.as_ptr()
+        )
+    }
+    .map(|_| ())
+}
+
+#[cfg(unix)]
+const O_NONBLOCK_FLAG: i32 = 0x800;
+
+fn open_kmsg_at_end() -> Result<File> {
+    #[cfg(not(unix))]
+    {
+        bail!("kernel log fallback is only supported on unix targets");
+    }
+
+    #[cfg(unix)]
+    {
+        let mut last_error = None;
+
+        for path in ["/dev/kmsg", "/kmsg"] {
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK_FLAG)
+                .open(path)
+            {
+                Ok(mut file) => {
+                    file.seek(SeekFrom::End(0))
+                        .with_context(|| format!("Cannot seek {path} to end"))?;
+                    log::info!("Reading kernel log from {path}");
+                    return Ok(file);
+                }
+                Err(error) => {
+                    last_error = Some((path, error));
+                }
+            }
+        }
+
+        match last_error {
+            Some((path, error)) => Err(error)
+                .with_context(|| format!("Cannot open kernel log device, last tried {path}")),
+            None => bail!("No kernel log device candidate"),
+        }
     }
 }
 
 fn read_new_kmsg(file: &mut File) -> Result<String> {
-    let mut output = Vec::new();
-    let mut record = [0u8; 8192];
-
-    loop {
-        match file.read(&mut record) {
-            Ok(0) => break,
-            Ok(length) => {
-                output.extend_from_slice(&record[..length]);
-                output.push(b'\n');
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-            Err(error) => return Err(error).context("Cannot read /dev/kmsg"),
-        }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        bail!("kernel log fallback is only supported on unix targets");
     }
 
-    Ok(String::from_utf8_lossy(&output).into_owned())
+    #[cfg(unix)]
+    {
+        let mut output = Vec::new();
+        let mut record = [0u8; 8192];
+
+        loop {
+            match file.read(&mut record) {
+                Ok(0) => break,
+                Ok(length) => {
+                    output.extend_from_slice(&record[..length]);
+                    output.push(b'\n');
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error).context("Cannot read kmsg"),
+            }
+        }
+
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
 }
 
 fn extract_required_vermagic(kmsg: &str) -> Option<String> {
@@ -176,7 +349,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize> {
 
     value
         .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
+        .map(|next| next & !(alignment - 1))
         .context("ELF alignment overflow")
 }
 
@@ -291,7 +464,6 @@ fn replace_module_vermagic(buffer: &mut Vec<u8>, required_vermagic: &str) -> Res
     buffer.resize(new_offset, 0);
     buffer.extend_from_slice(&new_modinfo);
 
-    // Elf64_Shdr: sh_offset at +0x18, sh_size at +0x20.
     write_elf64_word(
         buffer,
         location.section_header_offset + 0x18,
@@ -310,83 +482,6 @@ fn replace_module_vermagic(buffer: &mut Vec<u8>, required_vermagic: &str) -> Res
         required_vermagic
     );
     Ok(())
-}
-
-/// Relocate undefined symbols in an ELF kernel module buffer using /proc/kallsyms,
-/// then load it via init_module syscall.
-pub fn load_module(data: &[u8], params: &CStr) -> Result<()> {
-    let mut buffer = data.to_vec();
-    let elf = Elf::parse(&buffer)?;
-    let ctx = *elf.syms.ctx();
-
-    let mut unresolved_symbols: HashMap<String, (Sym, usize)> = HashMap::new();
-    for (index, sym) in elf.syms.iter().enumerate() {
-        if index == 0 {
-            continue;
-        }
-
-        if sym.st_shndx != section_header::SHN_UNDEF as usize {
-            continue;
-        }
-
-        let Some(name) = elf.strtab.get_at(sym.st_name) else {
-            continue;
-        };
-
-        let offset = elf.syms.offset() + index * Sym::size_with(elf.syms.ctx());
-        unresolved_symbols.insert(name.to_owned(), (sym, offset));
-    }
-
-    if !unresolved_symbols.is_empty() {
-        for_each_kernel_symbols(|(symbol, addr)| {
-            if let Some((mut sym, offset)) = unresolved_symbols.remove(symbol) {
-                sym.st_shndx = section_header::SHN_ABS as usize;
-                sym.st_value = *addr;
-                buffer.pwrite_with(sym, offset, ctx)?;
-            }
-
-            Ok(!unresolved_symbols.is_empty())
-        })
-        .context("Cannot parse kallsyms")?;
-    }
-
-    for name in unresolved_symbols.keys() {
-        log::warn!("Cannot find symbol: {}", name);
-    }
-
-    let mut kmsg = match open_kmsg_at_end() {
-        Ok(file) => Some(file),
-        Err(error) => {
-            log::warn!("Cannot prepare kmsg fallback: {error:#}");
-            None
-        }
-    };
-
-    match init_module(&buffer, params) {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            let logs = match kmsg.as_mut() {
-                Some(file) => read_new_kmsg(file).unwrap_or_default(),
-                None => String::new(),
-            };
-
-            let Some(required_vermagic) = extract_required_vermagic(&logs) else {
-                log::error!("Kernel module loading log:\n{}", logs);
-                return Err(first_error).context("init_module failed without vermagic mismatch");
-            };
-
-            log::warn!(
-                "Kernel requires vermagic {:?}; replacing and retrying",
-                required_vermagic
-            );
-
-            replace_module_vermagic(&mut buffer, &required_vermagic)
-                .context("Cannot replace module vermagic")?;
-
-            init_module(&buffer, params).context("init_module failed after replacing vermagic")?;
-            Ok(())
-        }
-    }
 }
 
 fn has_kernelsu_legacy() -> bool {
@@ -411,8 +506,8 @@ fn has_kernelsu_v2() -> bool {
     use syscalls::{Sysno, syscall};
     const KSU_INSTALL_MAGIC1: u32 = 0xDEADBEEF;
     const KSU_INSTALL_MAGIC2: u32 = 0xCAFEBABE;
-    const KSU_IOCTL_GET_INFO: u32 = 0x80104b02; // _IOR('K', 2, struct ksu_get_info_cmd)
-    const KSU_IOCTL_GET_INFO_LEGACY: u32 = 0x80004b02; // _IOC(_IOC_READ, 'K', 2, 0)
+    const KSU_IOCTL_GET_INFO: u32 = 0x80104b02;
+    const KSU_IOCTL_GET_INFO_LEGACY: u32 = 0x80004b02;
 
     #[repr(C)]
     #[derive(Default)]
@@ -431,7 +526,6 @@ fn has_kernelsu_v2() -> bool {
         features: u32,
     }
 
-    // Try new method: get driver fd using reboot syscall with magic numbers
     let mut fd: i32 = -1;
     unsafe {
         let _ = syscall!(
@@ -444,7 +538,6 @@ fn has_kernelsu_v2() -> bool {
     }
 
     let version = if fd >= 0 {
-        // New method: try to get version info via ioctl
         let mut cmd = GetInfoCmd::default();
         let version = unsafe {
             let ret = syscall!(Sysno::ioctl, fd, KSU_IOCTL_GET_INFO, &mut cmd as *mut _);
@@ -452,14 +545,14 @@ fn has_kernelsu_v2() -> bool {
             match ret {
                 Ok(_) => cmd.version,
                 Err(_) => {
-                    let mut cmd = GetInfoLegacyCmd::default();
+                    let mut legacy = GetInfoLegacyCmd::default();
                     match syscall!(
                         Sysno::ioctl,
                         fd,
                         KSU_IOCTL_GET_INFO_LEGACY,
-                        &mut cmd as *mut _
+                        &mut legacy as *mut _
                     ) {
-                        Ok(_) => cmd.version,
+                        Ok(_) => legacy.version,
                         Err(_) => 0,
                     }
                 }

@@ -49,6 +49,14 @@ import me.weishu.kernelsu.ui.component.material.TopBarBackButton
 import me.weishu.kernelsu.ui.component.material.expressiveTopAppBarColors
 import me.weishu.kernelsu.ui.util.LkmSelection
 
+private data class AdvancedOptionItem(
+    val key: String,
+    val title: String,
+    val summary: String,
+    val checked: Boolean,
+    val onCheckedChange: (Boolean) -> Unit,
+)
+
 /**
  * @author weishu
  * @date 2024/3/12.
