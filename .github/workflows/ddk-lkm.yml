@@ -12,6 +12,11 @@ on:
         required: false
         default: '20260828'
         type: string
+      package_name:
+        description: 'package name of manager'
+        required: false
+        default: ''
+        type: string
       expected_size:
         description: 'Expected Manager signature size'
         required: false
@@ -90,6 +95,7 @@ jobs:
 
     - name: Build kernelsu.ko
       env:
+        PACKAGE_NAME: ${{ inputs.package_name }}
         EXPECTED_SIZE: ${{ inputs.expected_size }}
         EXPECTED_HASH: ${{ inputs.expected_hash }}
       run: |
@@ -109,7 +115,16 @@ jobs:
           exit 1
         fi
         if [ -n "$EXPECTED_SIZE" ]; then
-          EXTRA_ARGS="KSU_EXPECTED_SIZE=$EXPECTED_SIZE KSU_EXPECTED_HASH=$EXPECTED_HASH"
+          EXTRA_ARGS="$EXTRA_ARGS KSU_EXPECTED_SIZE=$EXPECTED_SIZE"
+        fi
+        if [ -n "$EXPECTED_HASH" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_EXPECTED_HASH=$EXPECTED_HASH"
+        fi
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_IS_PR_BUILD=1"
+        fi
+        if [ -n "$PACKAGE_NAME" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_PACKAGE_NAME=$PACKAGE_NAME"
         fi
         CONFIG_KSU=m CC=clang make $EXTRA_ARGS
         
@@ -142,6 +157,7 @@ jobs:
     - name: Build kernelsu.ko for x64
       if: ${{ !inputs.vivo }}
       env:
+        PACKAGE_NAME: ${{ inputs.package_name }}
         EXPECTED_SIZE: ${{ inputs.expected_size }}
         EXPECTED_HASH: ${{ inputs.expected_hash }}
       run: |
@@ -189,7 +205,16 @@ jobs:
           exit 1
         fi
         if [ -n "$EXPECTED_SIZE" ]; then
-          EXTRA_ARGS="KSU_EXPECTED_SIZE=$EXPECTED_SIZE KSU_EXPECTED_HASH=$EXPECTED_HASH"
+          EXTRA_ARGS="$EXTRA_ARGS KSU_EXPECTED_SIZE=$EXPECTED_SIZE"
+        fi
+        if [ -n "$EXPECTED_HASH" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_EXPECTED_HASH=$EXPECTED_HASH"
+        fi
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_IS_PR_BUILD=1"
+        fi
+        if [ -n "$PACKAGE_NAME" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS KSU_PACKAGE_NAME=$PACKAGE_NAME"
         fi
         
         MDIR=$(realpath .)
